@@ -2,3 +2,6 @@
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
 F3D = "9c67f86a-bae4-5246-a7f1-3af54b9e6640"
 GMTF3D = "fdccb625-bdcb-4ada-a16d-8b3036ea332b"
+
+[compat]
+Documenter = "1.17.0"
