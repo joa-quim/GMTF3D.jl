@@ -26,7 +26,9 @@ jobs:
           - '1.10'
           - '1'
         os:
-          - ubuntu-latest
+          # Windows only: F3D.jl ships a Windows-only binary (the nightly raytracing
+          # asset has no Linux/macOS build), so the package cannot load elsewhere.
+          - windows-latest
         arch:
           - x64
     steps:
