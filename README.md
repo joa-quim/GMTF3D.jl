@@ -1,6 +1,8 @@
 # GMTF3D
 
+[![Dev](https://img.shields.io/badge/docs-dev-blue.svg)](https://joa-quim.github.io/GMTF3D/dev/)
 [![Build Status](https://github.com/joa-quim/GMTF3D/actions/workflows/CI.yml/badge.svg?branch=master)](https://github.com/joa-quim/GMTF3D/actions/workflows/CI.yml?query=branch%3Amaster)
+[![Docs](https://github.com/joa-quim/GMTF3D/actions/workflows/Docs.yml/badge.svg?branch=master)](https://github.com/joa-quim/GMTF3D/actions/workflows/Docs.yml?query=branch%3Amaster)
 
 **An interactive 3-D visualization environment for [GMT.jl](https://github.com/GenericMappingTools/GMT.jl).**
 
