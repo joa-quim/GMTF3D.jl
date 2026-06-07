@@ -1,6 +1,6 @@
 # GMTF3D
 
-[![Build Status](https://github.com/Joa-quim/GMTF3D.jl/actions/workflows/CI.yml/badge.svg?branch=master)](https://github.com/Joa-quim/GMTF3D.jl/actions/workflows/CI.yml?query=branch%3Amaster)
+[![Build Status](https://github.com/joa-quim/GMTF3D/actions/workflows/CI.yml/badge.svg?branch=master)](https://github.com/joa-quim/GMTF3D/actions/workflows/CI.yml?query=branch%3Amaster)
 
 **An interactive 3-D visualization environment for [GMT.jl](https://github.com/GenericMappingTools/GMT.jl).**
 
