@@ -29,14 +29,16 @@ jobs:
         with:
           version: '1'
       - uses: julia-actions/cache@v2
-      # F3D is not registered — dev it from GitHub so the docs project can resolve it.
-      - name: Develop unregistered F3D dependency
-        run: julia --project=docs -e 'using Pkg; Pkg.develop(url="https://github.com/joa-quim/F3D.jl")'
+      # Both GMTF3D (this repo) and F3D are unregistered, so dev them together in a
+      # single resolve before instantiating the docs environment.
       - name: Instantiate docs environment
         run: |
           julia --project=docs -e '
             using Pkg
-            Pkg.develop(PackageSpec(path=pwd()))
+            Pkg.develop([
+                PackageSpec(path=pwd()),
+                PackageSpec(url="https://github.com/joa-quim/F3D.jl"),
+            ])
             Pkg.instantiate()'
       - name: Build and deploy documentation
         run: julia --project=docs docs/make.jl
