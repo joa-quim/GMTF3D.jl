@@ -35,7 +35,7 @@ jobs:
         with:
           version: ${{ matrix.version }}
           arch: ${{ matrix.arch }}
-      - uses: julia-actions/cache@v2
+      - uses: julia-actions/cache@v3
       # F3D is not registered — dev it from GitHub so the project can resolve.
       # (Stock F3D binaries are downloaded per-platform; the patched f3d_ext DLL is
       # Windows-only, so on Linux CI the extended features no-op — the tests don't use them.)
