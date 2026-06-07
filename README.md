@@ -3,6 +3,8 @@
 [![Dev](https://img.shields.io/badge/docs-dev-blue.svg)](https://joa-quim.github.io/GMTF3D/dev/)
 [![Build Status](https://github.com/joa-quim/GMTF3D/actions/workflows/CI.yml/badge.svg?branch=master)](https://github.com/joa-quim/GMTF3D/actions/workflows/CI.yml?query=branch%3Amaster)
 [![Docs](https://github.com/joa-quim/GMTF3D/actions/workflows/Docs.yml/badge.svg?branch=master)](https://github.com/joa-quim/GMTF3D/actions/workflows/Docs.yml?query=branch%3Amaster)
+[![GMT.jl](https://img.shields.io/badge/built%20on-GMT.jl-brightgreen.svg)](https://github.com/GenericMappingTools/GMT.jl)
+[![F3D.jl](https://img.shields.io/badge/rendered%20by-F3D.jl-orange.svg)](https://github.com/joa-quim/F3D.jl)
 
 **An interactive 3-D visualization environment for [GMT.jl](https://github.com/GenericMappingTools/GMT.jl).**
 
