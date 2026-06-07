@@ -1,0 +1,46 @@
+name: Docs
+on:
+  push:
+    branches:
+      - master
+    tags: ['*']
+  pull_request:
+  workflow_dispatch:
+concurrency:
+  # Skip intermediate builds: always.
+  # Cancel intermediate builds: only if it is a pull request build.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
+permissions:
+  contents: write
+  pull-requests: read
+  statuses: write
+jobs:
+  docs:
+    name: Documentation
+    # Windows-only: F3D.jl ships a Windows-only binary, so `using GMTF3D` (which
+    # loads F3D) only works here. The gallery images are pre-rendered and committed,
+    # so the docs build itself executes no rendering and needs no patched f3d_ext DLL.
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+      # F3D is not registered — dev it from GitHub so the docs project can resolve it.
+      - name: Develop unregistered F3D dependency
+        run: julia --project=docs -e 'using Pkg; Pkg.develop(url="https://github.com/joa-quim/F3D.jl")'
+      - name: Instantiate docs environment
+        run: |
+          julia --project=docs -e '
+            using Pkg
+            Pkg.develop(PackageSpec(path=pwd()))
+            Pkg.instantiate()'
+      - name: Build and deploy documentation
+        run: julia --project=docs docs/make.jl
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JULIA_PKG_SERVER: ""
+          GKSwstype: "100"

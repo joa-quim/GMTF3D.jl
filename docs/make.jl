@@ -8,6 +8,7 @@ makedocs(;
     authors="Joaquim <jluis@ualg.pt> and contributors",
     sitename="GMTF3D.jl",
     format=Documenter.HTML(;
+        canonical="https://joa-quim.github.io/GMTF3D",
         edit_link="master",
         assets=String[],
     ),
@@ -18,3 +19,5 @@ makedocs(;
         "Raytracing (OSPRay)" => "raytracing.md",
     ],
 )
+
+deploydocs(; repo="github.com/joa-quim/GMTF3D", devbranch="master", push_preview=true)
