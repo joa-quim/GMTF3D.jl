@@ -24,7 +24,7 @@ jobs:
       matrix:
         version:
           - '1.10'
-          - 'pre'
+          - '1'
         os:
           - ubuntu-latest
         arch:
@@ -36,5 +36,10 @@ jobs:
           version: ${{ matrix.version }}
           arch: ${{ matrix.arch }}
       - uses: julia-actions/cache@v2
+      # F3D is not registered — dev it from GitHub so the project can resolve.
+      # (Stock F3D binaries are downloaded per-platform; the patched f3d_ext DLL is
+      # Windows-only, so on Linux CI the extended features no-op — the tests don't use them.)
+      - name: Develop unregistered F3D dependency
+        run: julia --project=. -e 'using Pkg; Pkg.develop(url="https://github.com/joa-quim/F3D.jl")'
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
