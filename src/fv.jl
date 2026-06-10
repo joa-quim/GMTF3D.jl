@@ -92,7 +92,7 @@ function _view_fv_impl(fv::GMT.GMTfv; _handle_chan=nothing, title::AbstractStrin
 				 drape_light::Real=1.0, drape_unlit::Bool=false, _edge_width::Real=1.0,
 				 metallic=NaN, roughness=NaN, emissive=nothing, georef=nothing, colorbar=nothing,
 				 lines=nothing, line_color=nothing, line_width::Real=2.0, line_zfac::Real=1.0, L=nothing,
-				 vcurtain=nothing)
+				 vcurtain=nothing, vcolor=nothing)
 	lines = (L === nothing) ? lines : L          # `L` = GMT-style short alias for `lines`
 	savefmt = F3D.PNG
 	if (!isempty(mapexport))
@@ -218,16 +218,28 @@ function _view_fv_impl(fv::GMT.GMTfv; _handle_chan=nothing, title::AbstractStrin
 	elseif (m.ncolors > 0)                      # per-face colour palette: scivis scalar + colormap
 		hi = m.ncolors == 1 ? 1.0 : Float64(m.ncolors)   # index 1..ncol -> exact control points
 		_set_scivis_palette!(opts, m.palette, m.ncolors, "color"; cells=true, range=(1.0, hi))
+	elseif (vcolor !== nothing)                 # per-VERTEX z colour (fast grid path): smooth scivis ramp
+		_set_scivis_palette!(opts, vcolor.pal, vcolor.n, "zcolor"; cells=false,
+							 range=(Float64(vcolor.vmin), Float64(vcolor.vmax)))
 	end
 
 	cscal = m.ncolors > 0 ? [mvscalar("color", m.face_scalar)] : MVScalar[]   # per-face palette colour
+	# Per-vertex elevation scalar (fast grid path). The shared-vertex mesh keeps TRUE z in
+	# m.points (z is a GPU transform, not baked), so the z component IS the colour scalar.
+	pscal = MVScalar[]
+	if (vcolor !== nothing && m.ncolors == 0 && !do_drape)
+		nv  = length(m.points) ÷ 3
+		zsc = Vector{Float32}(undef, nv)
+		@inbounds for i in 1:nv;  zsc[i] = m.points[3i];  end
+		pscal = [mvscalar("zcolor", zsc)]
+	end
 	# Vertical exaggeration as a GPU transform (mesh_view::transform_3d): the geometry keeps
 	# true z; the actor is scaled in z at render time. `fv.zscale` is set by tri2fv/poly2fv (1.0
 	# = none). The interactive Ctrl-drag vertical scale (render.model_scale) composes on top.
 	zs = fv.zscale
 	mv_transform = (zs > 0 && zs != 1.0) ? (; scale=(1.0, 1.0, Float64(zs))) : nothing
 	add_mesh_view!(scene, engine, m.points, m.normals, m.texcoords, m.sides, m.indices;
-	               name="mesh", cell_scalars=cscal, texture=drape_tex, transform=mv_transform) ||
+	               name="mesh", point_scalars=pscal, cell_scalars=cscal, texture=drape_tex, transform=mv_transform) ||
 		(F3D.f3d_engine_delete(engine); error("f3d_scene_add_mesh_view failed"))
 
 	# Vertical curtains (Fledermaus seismic / midwater profiles) hung into THIS scene — each
