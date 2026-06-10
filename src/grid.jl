@@ -38,15 +38,17 @@ function tri2fv(D::Vector{<:GMT.GMTdataset}; cmap=:turbo, zscale=:auto,
 	xmin, xmax = extrema(@view V[:, 1])
 	ymin, ymax = extrema(@view V[:, 2])
 	zmin, zmax = extrema(@view V[:, 3])
+	# Vertical scale is carried as a GPU transform (GMTfv.zscale -> mesh_view::transform_3d in
+	# the viewer), NOT baked into the geometry, so verts/bbox keep TRUE z (correct colour range,
+	# axis values, picked coordinates). See _view_fv_impl.
 	s = _resolve_zscale(zscale, xmax - xmin, ymax - ymin, zmax - zmin, vfrac, isgeog, vexag)
-	s == 1.0 || (@inbounds @views V[:, 3] .*= s)     # apply vertical scale to geometry
 	czmin, czmax = extrema(zc)                        # colour range from true z
 	step = czmax > czmin ? (czmax - czmin) / ncolor : 1.0
 	C  = GMT.makecpt(cmap = string(cmap), range = (czmin, czmax, step))
 	cm = C.colormap
 	col = [string("-G", z_to_hex(zc[k], cm, czmin, czmax)) for k in 1:nT]
-	bb = Float64[xmin, xmax, ymin, ymax, extrema(@view V[:, 3])...]
-	return GMT.GMTfv(verts = V, faces = [F], color = [col], bbox = bb, isflat = [false])
+	bb = Float64[xmin, xmax, ymin, ymax, zmin, zmax]
+	return GMT.GMTfv(verts = V, faces = [F], color = [col], bbox = bb, isflat = [false], zscale = s)
 end
 
 """
@@ -99,6 +101,29 @@ coloured `GMTfv` -> interactive viewer (or an offscreen export).
 	- `:transparent` — keep full grid; uncovered area is see-through.
 - `outside_color=200`: fill colour for `:shade`/`:shademesh` — a grey `0-255`, or
   an `(r,g,b)` tuple (`0-255` ints, or `0-1` floats).
+
+# Vertical curtains (Fledermaus-style seismic / midwater profiles)
+- `vcurtain=nothing`: hang one or more image "curtains" — vertical walls that follow an
+  XY path THROUGH the scene, sharing the grid's coordinate space and vertical scale so
+  they stand under / weave through the relief. A curtain is a NamedTuple:
+    - `image`: the profile — a `GMTimage`, or a file-path `String` that **F3D loads
+      itself** (no `gmtread` import).
+    - `path`: the horizontal track — an `N×2` matrix (`x y`) or a `GMTdataset`. `N=2` is
+      the simplest "two-points" straight curtain; more points let the image weave.
+    - `zrange=(zmin, zmax)`: the vertical extent the image spans (data z units).
+    - `spacing=:distance`: column placement — `:distance` (by cumulative track length),
+      `:simple` (even per point), or `:geomatch` (caller `cols`, per-point pixel columns).
+    - `cols=nothing`: the `:geomatch` per-point column positions.
+    - `flipv=false`: flip the vertical image sense if it comes out upside down.
+    - `clip=false`: when `true` (or `:surface`), cut the curtain's top edge to the grid
+      surface — the wall hugs the bathymetry and the image ABOVE the relief is dropped
+      (only the sub-surface part shows). The track is densified and the seafloor sampled
+      along it; `clip_n=300` sets that column resolution. Clip needs the grid, so it works
+      only through `view_grid`/`f3dview` (a bare `view_fv` curtain has no surface to cut to).
+  Pass one NamedTuple, or a **vector** of them for several curtains. The image is drawn
+  unlit (emissive) so it shows exact pixels while the relief keeps its shading.
+  E.g. `view_grid(G; vcurtain=(; image="profile.jpg", path=track, zrange=(-2000,0)))`, or
+  clipped: `view_grid(G; vcurtain=(; image=I, path=track, zrange=(-10000,0), clip=true))`.
 
 # Colour bar
 - `colorbar=true`: draw a colour scale (right edge) keyed on the grid's true z range
@@ -173,6 +198,19 @@ function view_grid(G; cmap=:turbo, zscale=:auto, vfrac=0.2, vexag=:auto, ncolor:
 	# all default in _view_fv_impl — scale_handle = true, the SAME default
 	# view_points uses, so both viewers enable the rings by the identical procedure.
 	vkw = Dict{Symbol,Any}(kwargs)
+
+	# Resolve any clip-to-surface vcurtain here, where we still have the grid: sample the
+	# bathymetry along the (densified) track so the curtain's top edge hugs the relief and
+	# the image above the surface is dropped. No-op for curtains without `clip`.
+	# Clip-to-surface vcurtain: sample the bathymetry along the (densified) track so the
+	# curtain top hugs the relief. Spec VALIDATION (incl. missing-image bail) is done once,
+	# downstream in `view_fv` — the single gatekeeper for both view_grid and direct view_fv,
+	# so a bad spec prints its clean message exactly ONCE. `_resolve_vcurtain_clip` only reads
+	# the grid + track (never the image), so it is safe to run before that check.
+	if haskey(vkw, :vcurtain) && _vcurtain_problem(vkw[:vcurtain]) == ""
+		Gh = isa(G, GMT.GMTgrid) ? G : GMT.gmtread(G)
+		vkw[:vcurtain] = _resolve_vcurtain_clip(vkw[:vcurtain], Gh)
+	end
 
 	# Line overlays (`lines=`) carry z in DATA units; the surface is drawn with the
 	# vertical scale `_resolve_zscale` gives, so forward that SAME factor as `line_zfac`
