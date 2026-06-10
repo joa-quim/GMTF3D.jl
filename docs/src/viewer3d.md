@@ -27,6 +27,7 @@ using GMT          # the GMT data constructors used throughout (peaks, gmtread, 
 - [`view_fv` — solids and meshes](#view_fv--solids-and-meshes)
 - [Vertical scale (exaggeration)](#vertical-scale-exaggeration)
 - [Draping images over a surface](#draping-images-over-a-surface)
+- [Vertical curtains (seismic / midwater profiles)](#vertical-curtains-seismic--midwater-profiles)
 - [Camera, background, materials, export](#camera-background-materials-export)
 - [Non-blocking (async) windows](#non-blocking-async-windows)
 - [Extended interactions (`f3d_ext`)](#extended-interactions-f3d_ext)
@@ -101,7 +102,7 @@ view_grid(G; cmap=:turbo, zscale=:auto, vfrac=0.2, vexag=:auto, ncolor=256,
           thickness=0.0, isbase=false, downsample=0, ratio=0.01,
           bottom=false, wall_only=false, top_only=false, geog=false,
           drape=GMTimage(), drape_clip=false, outside=:drop, outside_color=200,
-          colorbar=true, kwargs...)
+          colorbar=true, vcurtain=nothing, kwargs...)
 ```
 
 `G` is a `GMTgrid` or a filename/remote name GMT can read. The grid is
@@ -262,6 +263,55 @@ grid area **not** covered by the image:
 `outside_color=200` is the grey level (0–255) of the fill. `drape_light=1.0` is the
 emissive factor for the draped image (1.0 = true colour, lower = more relief
 shading).
+
+---
+
+## Vertical curtains (seismic / midwater profiles)
+
+Hang an image as a **vertical curtain** — a wall that follows an XY track through
+the scene, the Fledermaus way of showing seismic / midwater profiles standing
+under (and weaving through) the bathymetry. It is a `view_grid` / `f3dview`
+option, so the curtain shares the grid's coordinate space **and** its vertical
+scale. The image is drawn unlit (emissive), so it shows the exact pixels while the
+relief keeps its shading.
+
+```julia
+img = joinpath(pkgdir(GMTF3D), "examples", "assets", "seismic_E46.jpg")
+G   = grdcut("@earth_relief_04m", region=(-12,0,35,45))
+
+# straight two-point curtain hanging 0 → −10000 m, clipped to the seafloor
+view_grid(G; vcurtain=(; image=img, path=[-11.045 36.077; -6.9846 36.1846],
+                       zrange=(-10000, 0), clip=true))
+```
+
+`vcurtain` is one spec `NamedTuple`, or a **vector** of them for several curtains.
+Fields:
+
+| field | meaning |
+|-------|---------|
+| `image` | the profile — a `GMTimage`, or a file-path `String` that **F3D loads itself** (no `gmtread`) |
+| `path` | the horizontal track — an `N×2` matrix (`x y`) or a `GMTdataset`. `N=2` is the simplest "two-points" straight curtain; more points let the image weave |
+| `zrange` | `(zmin, zmax)` — the vertical extent the image spans (data *z* units) |
+| `spacing` | column placement: `:distance` (default, by cumulative track length), `:simple` (even per point), `:geomatch` (per-point pixel columns via `cols`) |
+| `cols` | the `:geomatch` per-point column positions |
+| `flipv` | `false` (default); set `true` if the image comes out upside down |
+| `clip` | `false` (default). `true` cuts the curtain's top edge to the **grid surface** — the wall hugs the bathymetry and the image above the relief is dropped (sub-surface part only) |
+| `clip_n` | column resolution of the clip cut (default `300`); the track is densified and the seafloor sampled along it |
+
+Each pixel **column** is placed at a track position; the rows fill `zrange`. `clip`
+needs the grid to sample, so it works only through `view_grid` / `f3dview` (a bare
+`view_fv` curtain has no surface to cut to). The image's vertical registration is
+taken as linear over `zrange` — set `zrange` to the section's true top/bottom so the
+clip lands at the right reflectors.
+
+```julia
+# several weaving curtains from ship tracks, image given in-memory
+view_grid(G; vcurtain=[(; image=I1, path=track1, zrange=(-8000,0), clip=true),
+                       (; image=I2, path=track2, zrange=(-8000,0), clip=true)])
+```
+
+A bad spec (missing image file, `zmax ≤ zmin`, fewer than two track points) prints a
+single clean message and the call returns without opening a window.
 
 ---
 
