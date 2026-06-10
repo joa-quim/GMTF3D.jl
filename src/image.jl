@@ -59,25 +59,14 @@ function _view_image_impl(I::GMT.GMTimage; _handle_chan=nothing, title::Abstract
 
 	# Drape the image as an UNLIT texture: emissive = image at full factor and the
 	# diffuse light killed, so the quad shows the exact pixels with no relief shading.
-	tex_path = joinpath(tempdir(), "f3d_image_$(getpid()).png")
-	GMT.gmtwrite(tex_path, I)
-	cp = collapse_path(tex_path)
-	F3D.f3d_options_set_as_string(opts, "model.color.texture", cp)
-	F3D.f3d_options_set_as_string(opts, "model.emissive.texture", cp)
-	F3D.f3d_options_set_as_double_vector(opts, "model.emissive.factor", Cdouble[1, 1, 1], Csize_t(3))
 	F3D.f3d_options_set_as_double(opts, "render.light.intensity", Cdouble(0.0))
 
-	GC.@preserve m begin
-		nrm = isempty(m.normals)   ? C_NULL : pointer(m.normals)
-		tex = isempty(m.texcoords) ? C_NULL : pointer(m.texcoords)
-		mesh = Ref(F3D.f3d_mesh_t(
-			pointer(m.points),   Csize_t(length(m.points)),
-			nrm,                 Csize_t(length(m.normals)),
-			tex,                 Csize_t(length(m.texcoords)),
-			pointer(m.sides),    Csize_t(length(m.sides)),
-			pointer(m.indices),  Csize_t(length(m.indices))))
-		F3D.f3d_scene_add_mesh(scene, mesh) == 1 || (F3D.f3d_engine_delete(engine); error("f3d_scene_add_mesh failed"))
-	end
+	# Carry the image as an in-memory base-colour+emissive texture on the mesh_view
+	# itself (no temp PNG, no model.*.texture global override).
+	data, tw, th, tcomps = img_to_texbuf(I)
+	add_mesh_view!(scene, engine, m.points, m.normals, m.texcoords, m.sides, m.indices;
+	               name="image", texture=(; data, w=tw, h=th, comps=tcomps, emissive=true)) ||
+		(F3D.f3d_engine_delete(engine); error("f3d_scene_add_mesh_view failed"))
 
 	# Camera: orthographic, straight above, north up.
 	cam = F3D.f3d_window_get_camera(window)
@@ -133,7 +122,7 @@ function _view_image_impl(I::GMT.GMTimage; _handle_chan=nothing, title::Abstract
 	end
 
 	if offscreen
-		rm(tex_path; force=true)
+		_mv_release!(engine)
 		F3D.f3d_engine_delete(engine)
 		return nothing
 	end
@@ -154,8 +143,8 @@ function _view_image_impl(I::GMT.GMTimage; _handle_chan=nothing, title::Abstract
 		F3D.f3d_ext_disable_cube_axes(window)
 	end
 	lines === nothing || !_has_f3d_ext() || F3D.f3d_ext_clear_lines(window)
-	rm(tex_path; force=true)
 	F3D.f3d_scene_clear(scene)
+	_mv_release!(engine)
 	F3D.f3d_engine_delete(engine)
 	return nothing
 end
