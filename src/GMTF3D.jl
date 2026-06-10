@@ -10,6 +10,7 @@ module GMTF3D
 #   image.jl    – view_image: flat 2-D image viewer
 #   points.jl   – view_points: point clouds (+ rubber-band pick)
 #   lines.jl    – view_lines: standalone 3-D polylines
+#   curtain.jl  – vcurtain: vertical image "curtains" folded into view_grid
 #   f3dview.jl  – f3dview: single front-door dispatcher over all viewers
 
 using F3D
@@ -28,6 +29,7 @@ include("grid.jl")
 include("image.jl")
 include("points.jl")
 include("lines.jl")
+include("curtain.jl")
 include("f3dview.jl")
 
 end # module GMTF3D

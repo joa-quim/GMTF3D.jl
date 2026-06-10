@@ -72,9 +72,12 @@ per-face colours when present. Blocks until the window is closed, unless `async`
   the horizontal arrows to tilt, the compass ring to spin azimuth (Ctrl+left-drag also
   still scales). Supersedes `vscale_drag` when on.
 """
-view_fv(fv::GMT.GMTfv; async::Bool=true, kwargs...) =
-	(async && !get(kwargs, :offscreen, false)) ?   # offscreen has no window -> nothing to hand back
+function view_fv(fv::GMT.GMTfv; async::Bool=true, kwargs...)
+	# Validate on the REPL thread BEFORE any window; a bad spec prints a clean message and bails.
+	_check_vcurtain(get(kwargs, :vcurtain, nothing)) || return nothing
+	return (async && !get(kwargs, :offscreen, false)) ?   # offscreen has no window -> nothing to hand back
 		_async_view(ch -> _view_fv_impl(fv; _handle_chan=ch, kwargs...)) : _view_fv_impl(fv; kwargs...)
+end
 
 function _view_fv_impl(fv::GMT.GMTfv; _handle_chan=nothing, title::AbstractString="F3D — GMT solid",
 				 size::Tuple{Int,Int}=(1600, 1200), bg=(0.1, 0.1, 0.15),
@@ -88,7 +91,8 @@ function _view_fv_impl(fv::GMT.GMTfv; _handle_chan=nothing, title::AbstractStrin
 				 drape_emis::GMT.GMTimage=GMT.GMTimage(),
 				 drape_light::Real=1.0, drape_unlit::Bool=false, _edge_width::Real=1.0,
 				 metallic=NaN, roughness=NaN, emissive=nothing, georef=nothing, colorbar=nothing,
-				 lines=nothing, line_color=nothing, line_width::Real=2.0, line_zfac::Real=1.0, L=nothing)
+				 lines=nothing, line_color=nothing, line_width::Real=2.0, line_zfac::Real=1.0, L=nothing,
+				 vcurtain=nothing)
 	lines = (L === nothing) ? lines : L          # `L` = GMT-style short alias for `lines`
 	savefmt = F3D.PNG
 	if (!isempty(mapexport))
@@ -165,73 +169,72 @@ function _view_fv_impl(fv::GMT.GMTfv; _handle_chan=nothing, title::AbstractStrin
 	# vertical-scale changing render.model_scale); deleting early -> "Texture file does
 	# not exist" spam + lost texture. The per-face palette goes fully in-memory (gap #1).
 	tmp_files = String[]
+	drape_tex = nothing                         # in-memory drape texture (gap #1 fold), when applicable
 	if do_drape                                 # external image draped over surface
-		palette_path = joinpath(tempdir(), "f3d_drape_$(getpid()).png")
+		# Default drape (drape_light == 1, no separate emissive) is a single emissive
+		# base-colour texture -> carry it IN-MEMORY on the mesh_view (no temp PNG).
+		# Advanced cases need model.emissive.factor (fractional drape_light) or a 2nd
+		# image (drape_emis), neither expressible in mesh_view::texture_t, so those
+		# stay on the temp-PNG path.
+		fold_inmem = isempty(drape_emis) && drape_light == 1.0
+		local dimg                              # the image actually draped (clip-warped or raw)
 		if drape_clip                           # honour image coords: paint only the overlap
 			gx0, gx1 = extrema(@view fv.verts[:, 1])
 			gy0, gy1 = extrema(@view fv.verts[:, 2])
-			GMT.gmtwrite(palette_path, drape_to_bbox(drape, gx0, gx1, gy0, gy1))
+			dimg = drape_to_bbox(drape, gx0, gx1, gy0, gy1)
 			# warped canvas has an alpha band (0 outside the image) — enable blending
 			# so the non-overlap area reads as transparent, not opaque black.
 			F3D.f3d_options_set_as_bool(opts, "render.effect.blending.enable", Cint(1))
 		else                                    # stretch image over the whole surface
-			GMT.gmtwrite(palette_path, drape)   # GMTimage -> PNG (bands/layout handled)
+			dimg = drape
 		end
-		F3D.f3d_options_set_as_string(opts, "model.color.texture", collapse_path(palette_path))
-		push!(tmp_files, palette_path)
-		# A single headlight leaves draped imagery dim; make the image emissive so it
-		# shows near true-colour. `drape_light` is the emissive factor (1.0 = full image
-		# colour, lower keeps more relief shading). When `drape_emis` is given it is the
-		# emissive texture instead of the colour one — used by outside=:mesh so the grey
-		# (lit, edge-bearing) fill emits nothing while the image still glows.
-		emis_path = palette_path
-		if (!isempty(drape_emis))
-			emis_path = joinpath(tempdir(), "f3d_drape_emis_$(getpid()).png")
-			GMT.gmtwrite(emis_path, drape_emis)
-			push!(tmp_files, emis_path)
-		end
-		F3D.f3d_options_set_as_string(opts, "model.emissive.texture", collapse_path(emis_path))
-		ef = Cdouble(drape_light)
-		F3D.f3d_options_set_as_double_vector(opts, "model.emissive.factor", Cdouble[ef, ef, ef], Csize_t(3))
-		# `drape_unlit`: kill diffuse lighting so the surface shows ONLY the (full)
-		# emissive texture -> dead-flat, NO relief shading. Used by outside=:mesh, whose
-		# baked canvas is already flat fill + lines; any headlight would re-introduce the
-		# grey shading the user does not want.
-		drape_unlit && F3D.f3d_options_set_as_double(opts, "render.light.intensity", Cdouble(0.0))
-	elseif (m.ncolors > 0)                      # per-face colour palette
-		if _has_inmem_texture()                 # in-memory (gap #1): no temp PNG, survives re-render
-			palimg = F3D.f3d_image_new_params(Cuint(m.ncolors), Cuint(1), Cuint(3), F3D.BYTE)
-			GC.@preserve m F3D.f3d_image_set_content(palimg, pointer(m.palette))
-			F3D.f3d_window_set_color_texture(window, palimg)   # copies content into the renderer
-			F3D.f3d_image_delete(palimg)
+		if fold_inmem
+			data, tw, th, tc = img_to_texbuf(dimg)
+			drape_tex = (; data, w=tw, h=th, comps=tc, emissive=true)
+			# `drape_unlit`: kill diffuse lighting so the surface shows ONLY the (full)
+			# emissive image -> dead-flat, no relief shading.
+			drape_unlit && F3D.f3d_options_set_as_double(opts, "render.light.intensity", Cdouble(0.0))
 		else
-			pp = write_palette_png(m.palette, m.ncolors)
-			F3D.f3d_options_set_as_string(opts, "model.color.texture", pp)
-			push!(tmp_files, pp)
+			palette_path = joinpath(tempdir(), "f3d_drape_$(getpid()).png")
+			GMT.gmtwrite(palette_path, dimg)    # GMTimage -> PNG (bands/layout handled)
+			F3D.f3d_options_set_as_string(opts, "model.color.texture", collapse_path(palette_path))
+			push!(tmp_files, palette_path)
+			# A single headlight leaves draped imagery dim; make the image emissive so it
+			# shows near true-colour. `drape_light` is the emissive factor (1.0 = full image
+			# colour, lower keeps more relief shading). When `drape_emis` is given it is the
+			# emissive texture instead of the colour one — used by outside=:mesh so the grey
+			# (lit, edge-bearing) fill emits nothing while the image still glows.
+			emis_path = palette_path
+			if (!isempty(drape_emis))
+				emis_path = joinpath(tempdir(), "f3d_drape_emis_$(getpid()).png")
+				GMT.gmtwrite(emis_path, drape_emis)
+				push!(tmp_files, emis_path)
+			end
+			F3D.f3d_options_set_as_string(opts, "model.emissive.texture", collapse_path(emis_path))
+			ef = Cdouble(drape_light)
+			F3D.f3d_options_set_as_double_vector(opts, "model.emissive.factor", Cdouble[ef, ef, ef], Csize_t(3))
+			drape_unlit && F3D.f3d_options_set_as_double(opts, "render.light.intensity", Cdouble(0.0))
 		end
+	elseif (m.ncolors > 0)                      # per-face colour palette: scivis scalar + colormap
+		hi = m.ncolors == 1 ? 1.0 : Float64(m.ncolors)   # index 1..ncol -> exact control points
+		_set_scivis_palette!(opts, m.palette, m.ncolors, "color"; cells=true, range=(1.0, hi))
 	end
 
-	GC.@preserve m begin
-		nrm = isempty(m.normals)   ? C_NULL : pointer(m.normals)
-		tex = isempty(m.texcoords) ? C_NULL : pointer(m.texcoords)
-		mesh = Ref(F3D.f3d_mesh_t(pointer(m.points), Csize_t(length(m.points)),
-		                          nrm,               Csize_t(length(m.normals)),       # per-vertex normals
-		                          tex,               Csize_t(length(m.texcoords)),     # texcoords -> colour
-		                          pointer(m.sides),  Csize_t(length(m.sides)),
-		                          pointer(m.indices),Csize_t(length(m.indices))
-		                          ))
+	cscal = m.ncolors > 0 ? [mvscalar("color", m.face_scalar)] : MVScalar[]   # per-face palette colour
+	# Vertical exaggeration as a GPU transform (mesh_view::transform_3d): the geometry keeps
+	# true z; the actor is scaled in z at render time. `fv.zscale` is set by tri2fv/poly2fv (1.0
+	# = none). The interactive Ctrl-drag vertical scale (render.model_scale) composes on top.
+	zs = fv.zscale
+	mv_transform = (zs > 0 && zs != 1.0) ? (; scale=(1.0, 1.0, Float64(zs))) : nothing
+	add_mesh_view!(scene, engine, m.points, m.normals, m.texcoords, m.sides, m.indices;
+	               name="mesh", cell_scalars=cscal, texture=drape_tex, transform=mv_transform) ||
+		(F3D.f3d_engine_delete(engine); error("f3d_scene_add_mesh_view failed"))
 
-		err = Ref{Cstring}(C_NULL)
-		if (F3D.f3d_mesh_is_valid(mesh, err) != 1)
-			msg = err[] == C_NULL ? "unknown" : unsafe_string(err[])
-			err[] != C_NULL && F3D.f3d_utils_string_free(err[])
-			F3D.f3d_engine_delete(engine)
-			error("generated mesh is invalid: $msg")
-		end
-		(err[] != C_NULL) && F3D.f3d_utils_string_free(err[])
-
-		F3D.f3d_scene_add_mesh(scene, mesh) == 1 || error("f3d_scene_add_mesh failed")
-	end
+	# Vertical curtains (Fledermaus seismic / midwater profiles) hung into THIS scene — each
+	# an emissive image wall following an XY path, sharing the grid's vertical scale `zs` so it
+	# lines up with the relief. `vcurtain` is one spec NamedTuple or a vector of them (nothing =
+	# none). Added before the camera reset so the curtains are inside the framed bounds.
+	_add_curtains!(scene, engine, opts, vcurtain, zs)
 
 	isempty(lights) || add_lights!(scene, lights)
 
@@ -341,6 +344,7 @@ function _view_fv_impl(fv::GMT.GMTfv; _handle_chan=nothing, title::AbstractStrin
 
 	if offscreen
 		for f in tmp_files; rm(f; force=true); end   # drape temp PNGs (none if in-memory palette)
+		_mv_release!(engine)
 		F3D.f3d_engine_delete(engine)
 		return nothing
 	end
@@ -369,6 +373,7 @@ function _view_fv_impl(fv::GMT.GMTfv; _handle_chan=nothing, title::AbstractStrin
 	(lines === nothing) || !_has_f3d_ext() || F3D.f3d_ext_clear_lines(window)
 	for f in tmp_files; rm(f; force=true); end   # delete drape temp PNGs only now (window closed)
 	F3D.f3d_scene_clear(scene)        # drop actors before GL teardown -> avoids close-time AV in engine_delete
+	_mv_release!(engine)              # zero-copy buffers safe to drop only after scene cleared
 	F3D.f3d_engine_delete(engine)
 	return nothing
 end
@@ -515,8 +520,9 @@ function poly2fv(D::Vector{<:GMT.GMTdataset}; cmap=:turbo, zscale=:auto,
 	end
 	xmin, xmax = extrema(@view V[:, 1]);  ymin, ymax = extrema(@view V[:, 2])
 	zmin, zmax = extrema(@view V[:, 3])
+	# Vertical scale carried as a GPU transform (GMTfv.zscale), NOT baked into geometry — verts
+	# and bbox keep TRUE z. The viewer (_view_fv_impl) turns it into a mesh_view::transform_3d.
 	s = _resolve_zscale(zscale, xmax - xmin, ymax - ymin, zmax - zmin, vfrac, isgeog, vexag)
-	s == 1.0 || (@inbounds @views V[:, 3] .*= s)     # apply vertical scale to geometry
 	czmin, czmax = extrema(zc)                        # colour range from true z
 	# A flat slab (all faces equal mean-z) gives czmin == czmax -> makecpt errors
 	# "min >= max"; widen to a unit window so every face lands on the mid colour.
@@ -533,6 +539,6 @@ function poly2fv(D::Vector{<:GMT.GMTdataset}; cmap=:turbo, zscale=:auto,
 		end
 		push!(faces, Fm);  push!(colors, col)
 	end
-	bb = Float64[xmin, xmax, ymin, ymax, extrema(@view V[:, 3])...]
-	return GMT.GMTfv(verts = V, faces = faces, color = colors, bbox = bb, isflat = fill(false, length(faces)))
+	bb = Float64[xmin, xmax, ymin, ymax, zmin, zmax]
+	return GMT.GMTfv(verts = V, faces = faces, color = colors, bbox = bb, isflat = fill(false, length(faces)), zscale = s)
 end
