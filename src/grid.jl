@@ -67,6 +67,112 @@ function grid2fv(G; cmap=:turbo, zscale=:auto, vfrac=0.2, vexag=:auto, ncolor::I
 end
 
 """
+	grid2fv_direct(G; zscale=:auto, vfrac=0.2, vexag=:auto, downsample=0, isgeog=GMT.isgeog(G)) -> GMTfv
+
+Build a surface `GMTfv` straight from a `GMTgrid`'s structured topology — **no
+triangulation**. A grid is already regular, so the mesh is pure index arithmetic:
+`M·N` *shared* vertices (one per node) and `2·(M-1)·(N-1)` triangles (two per cell).
+This skips `GMT.grid2tri` entirely (the slow Delaunay + decimation path) and keeps
+vertices shared all the way to the GPU.
+
+The returned `GMTfv` carries **no per-face colour** — the surface is meant to be
+coloured per-vertex by elevation through the viewer's `vcolor` scivis path (smooth
+interpolated ramp + smooth normals), which `view_grid` wires up. Vertical scale is the
+same geog-aware GPU transform as [`tri2fv`](@ref) (`fv.zscale`).
+
+`z[i,j]` pairs with `(x[j], y[i])` (GMT.jl normalises every grid to y-ascending,
+`z[1,:]` = ymin). Cells with any NaN corner are dropped; the now-orphan vertices are kept
+in place (parked at the grid's min z so they neither draw, reach the GPU as NaN, nor perturb
+the bounds) — no compaction, no remap. `downsample>=2` strides the grid (every n-th node)
+before meshing; it replaces `grid2tri`'s `downsample`/`ratio` simplification for this path.
+
+This is the fast path `view_grid` uses for a plain surface. Solid/wall/thickness/base
+options still need `grid2tri` (real sided geometry), so `view_grid` routes those to
+[`grid2fv`](@ref) instead.
+
+**Float32-only:** a `Float64` grid is rejected (it would double the mesh footprint for no
+visual gain — the GPU path is `Float32`). The build is allocation-tight: verts (`Float32`)
+go straight into one `nv0×3` buffer in grid order (no vertex remap, ever); faces are
+pre-counted so the `Int` face buffer is sized exactly — neither array is oversized-then-
+trimmed. `G.hasnans` (0=unknown/scan, 1=none, 2=present) decides whether the NaN handling
+even runs. `view_grid` converts a stray `Float64` grid for you before calling this.
+"""
+function grid2fv_direct(G::GMT.GMTgrid; zscale=:auto, vfrac=0.2, vexag=:auto,
+						downsample::Int=0, isgeog::Bool=GMT.isgeog(G))
+	x = G.x;  y = G.y;  Z = G.z
+	eltype(Z) === Float64 &&
+		error("grid2fv_direct expects a Float32 grid (or less but got a z Float64 grid). " *
+			  "Convert first (e.g. `mat2grid(Float32.(G.z), G)`).")
+	ny, nx = size(Z)
+	(nx >= 2 && ny >= 2) || error("grid too small to mesh (need >= 2x2 nodes)")
+	s  = downsample >= 2 ? downsample : 1
+	js = collect(1:s:nx);  is = collect(1:s:ny)               # x (cols) / y (rows) node picks
+	mx = length(js);  my = length(is)
+	(mx >= 2 && my >= 2) || error("downsample too coarse: < 2x2 nodes left")
+	@inline gid(a, b) = (b - 1) * mx + a                      # a: x-index 1..mx, b: y-index 1..my
+	@inline cellbad(a, b) = isnan(Z[is[b],js[a]]) || isnan(Z[is[b],js[a+1]]) ||
+							isnan(Z[is[b+1],js[a+1]]) || isnan(Z[is[b+1],js[a]])
+	nv0   = mx * my
+	ncell = (mx - 1) * (my - 1)
+	# Verts kept in Float32 (input z is Float32; fv_to_mesh casts to Float32 for the GPU anyway,
+	# so no precision is lost vs the old Float64 buffer — it just stops doubling the footprint).
+	Vx = x isa AbstractVector{Float32} ? x : Float32.(x)
+	Vy = y isa AbstractVector{Float32} ? y : Float32.(y)
+
+	# Does any cell touch a NaN? Trust the grid's own flag (G.hasnans: 0=unknown, 1=no NaNs,
+	# 2=has NaNs) and only fall back to a scan when it doesn't know. The no-NaN case skips the
+	# vertex remap entirely (identity ids = grid node order).
+	hasnan = (G.hasnans == 1) ? false : (G.hasnans == 2) ? true :
+			 let f = false
+				 @inbounds for b in 1:my-1, a in 1:mx-1
+					 cellbad(a, b) && (f = true;  break)
+				 end
+				 f
+			 end
+
+	# Vertices: ALL nv0 nodes in grid order, identity ids — NO remap, NO compaction, so NO trim
+	# copy and no per-vertex branching. A NaN-z node is parked at the grid's min z: no surviving
+	# face references it (its cells are dropped below), so it never draws, while a finite value
+	# keeps NaN out of the GPU buffer and out of the bounds (min z is already a real z bound).
+	V = Matrix{Float32}(undef, nv0, 3)
+	if !hasnan
+		@inbounds for b in 1:my, a in 1:mx
+			g = gid(a,b);  V[g,1] = Vx[js[a]];  V[g,2] = Vy[is[b]];  V[g,3] = Z[is[b],js[a]]
+		end
+	else
+		zfill = Float32(G.range[5])              # grid min z (NaN-excluded) — the orphan sentinel
+		@inbounds for b in 1:my, a in 1:mx
+			g = gid(a,b);  z = Z[is[b],js[a]]
+			V[g,1] = Vx[js[a]];  V[g,2] = Vy[is[b]];  V[g,3] = ifelse(isnan(z), zfill, z)
+		end
+	end
+
+	# Faces: two CCW (upward-normal) triangles per cell; cells with a NaN corner dropped. Pre-count
+	# the survivors so F is sized EXACTLY — no oversize-then-trim copy.
+	nf = 2 * ncell
+	if hasnan
+		nf = 0
+		@inbounds for b in 1:my-1, a in 1:mx-1
+			cellbad(a, b) || (nf += 2)
+		end
+		nf == 0 && error("grid has no finite cells to mesh")
+	end
+	F = Matrix{Int}(undef, nf, 3);  k = 0
+	@inbounds for b in 1:my-1, a in 1:mx-1
+		hasnan && cellbad(a, b) && continue
+		v00 = gid(a,b);  v01 = gid(a+1,b);  v11 = gid(a+1,b+1);  v10 = gid(a,b+1)
+		F[k+1,1] = v00;  F[k+1,2] = v01;  F[k+1,3] = v11
+		F[k+2,1] = v00;  F[k+2,2] = v11;  F[k+2,3] = v10
+		k += 2
+	end
+
+	xmin, xmax = extrema(@view V[:,1]);  ymin, ymax = extrema(@view V[:,2]);  zmin, zmax = extrema(@view V[:,3])
+	sz = _resolve_zscale(zscale, Float64(xmax - xmin), Float64(ymax - ymin), Float64(zmax - zmin), vfrac, isgeog, vexag)
+	bb = Float64[xmin, xmax, ymin, ymax, zmin, zmax]
+	return GMT.GMTfv(verts = V, faces = [F], color = [String[]], bbox = bb, isflat = [false], zscale = sz)
+end
+
+"""
 	view_grid(G; kwargs...)
 
 Visualise a GMT grid `G` (a `GMTgrid` or a grid file name) in F3D: `grid2tri` ->
@@ -263,9 +369,29 @@ function view_grid(G; cmap=:turbo, zscale=:auto, vfrac=0.2, vexag=:auto, ncolor:
 	end
 
 	Gp = isa(G, GMT.GMTgrid) ? G : GMT.gmtread(G)
-	fv = grid2fv(Gp; cmap=cmap, zscale=zscale, vfrac=vfrac, vexag=vexag, ncolor=ncolor,
-				 thickness=thickness, isbase=isbase, downsample=downsample,
-				 ratio=ratio, bottom=bottom, wall_only=wall_only, top_only=top_only, geog=geog)
+
+	# Plain surface -> FAST PATH: build the mesh straight from the grid's structured
+	# topology (grid2fv_direct), no `grid2tri`. The solid/wall/thickness/base options
+	# build real sided geometry, NOT a height field, so they still need grid2tri (grid2fv).
+	needs_tri = thickness != 0 || isbase || bottom || wall_only || top_only
+	if needs_tri
+		fv = grid2fv(Gp; cmap=cmap, zscale=zscale, vfrac=vfrac, vexag=vexag, ncolor=ncolor,
+					 thickness=thickness, isbase=isbase, downsample=downsample,
+					 ratio=ratio, bottom=bottom, wall_only=wall_only, top_only=top_only, geog=geog)
+	else
+		# Fast path is Float32-only (grid2fv_direct refuses Float64 to avoid doubling the mesh
+		# footprint). view_grid is the convenience front door, so convert a stray Float64 grid
+		# here (one f32 copy of z; rare) instead of erroring in the user's face.
+		Gd = eltype(Gp.z) === Float32 ? Gp : GMT.mat2grid(Float32.(Gp.z), Gp)
+		fv = grid2fv_direct(Gd; zscale=zscale, vfrac=vfrac, vexag=vexag,
+							downsample=downsample, isgeog=(geog || GMT.isgeog(Gp)))
+		# Colour the bare surface per-VERTEX by elevation through the viewer's scivis ramp
+		# (smooth, shared-vertex). Skipped under a drape (the image is the colour then).
+		if isempty(drape)
+			zmn, zmx = Float64(Gp.range[5]), Float64(Gp.range[6])
+			get!(vkw, :vcolor, (; pal=cmap_palette(cmap, ncolor), n=ncolor, vmin=zmn, vmax=zmx))
+		end
+	end
 
 	# Colour scale keyed on the grid's true z range + the same colormap (not when an
 	# image is draped — then the surface shows the picture, not a z-colour ramp).
