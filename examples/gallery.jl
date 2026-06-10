@@ -65,6 +65,19 @@ drape_satellite(; kw...) = (G = GMT.grdcut("@earth_relief_02m", region=(-12, 0, 
                             I = mosaic(R=G, zoom=8, provider=:goog);
                             f3dview(G; drape=I, azimuth=10, elevation=45, kw...))
 
+# ── 3b. Vertical curtain (Fledermaus seismic / midwater profile) ───────────
+# A real seismic-profile image hung as a vertical wall UNDER the bathymetry, along
+# a ship track. `vcurtain` is an option of view_grid/f3dview: the image follows the
+# XY `path` (here a straight two-point track in the Gulf of Cádiz) over a fixed
+# `zrange` (0 down to -10000 m). The image is given as a FILE PATH so F3D loads it
+# itself (no gmtread import); a GMTimage works too. `clip=true` cuts the wall's top
+# edge to the seafloor so the part above the relief is dropped. NEEDS NETWORK.
+const SEISMIC_IMG = joinpath(@__DIR__, "assets", "seismic_E46.jpg")   # bundled WSW–ENE profile
+grid_vcurtain(; kw...) = (G = GMT.grdcut("@earth_relief_04m", region=(-12, 0, 35, 45));
+    f3dview(G; vcurtain = (; image = SEISMIC_IMG,
+                           path = [-11.045 36.077; -6.9846 36.1846],   # two-point track
+                           zrange = (-10000.0, 0.0), clip = true), kw...))
+
 # ── 4. Point cloud ────────────────────────────────────────────────────────
 cloud_z(;       kw...) = f3dview(demo_cloud(); pointsize=3, kw...)           # coloured by z (the default)
 cloud_sprites(; kw...) = f3dview(demo_cloud(); sprites=true, pointsize=6, kw...)   # round splats (needs f3d_ext)
@@ -85,6 +98,7 @@ const GALLERY = [
     "drape_shademesh"   => drape_shademesh,
     "drape_transparent" => drape_transparent,
     "drape_satellite"   => drape_satellite,
+    "grid_vcurtain"     => grid_vcurtain,
     "cloud_z"           => cloud_z,
     "cloud_sprites"     => cloud_sprites,
     "solid_torus"       => (; kw...) -> solid("torus"; kw...),
@@ -134,6 +148,11 @@ const GALLERY_DEMOS = [
         ("drape_satellite",   "real DEM (earth_relief) with a Google satellite mosaic draped, oblique view (needs network)",
             "G = GMT.grdcut(\"@earth_relief_02m\", region=(-12,0,35,45))\nI = mosaic(R=G, zoom=8, provider=:goog)\nf3dview(G; drape=I, azimuth=10, elevation=45)",
             "G = GMT.grdcut(\"@earth_relief_02m\", region=(-12,0,35,45)); f3dview(G; drape=mosaic(R=G, zoom=8, provider=:goog))"),
+    ],
+    "Vertical curtain (seismic / midwater profile)" => [
+        ("grid_vcurtain",     "a real seismic profile hung under the bathymetry along a ship track, clipped to the seafloor (needs network)",
+            "img = joinpath(pkgdir(GMTF3D), \"examples\", \"assets\", \"seismic_E46.jpg\")\nG = GMT.grdcut(\"@earth_relief_04m\", region=(-12,0,35,45))\nf3dview(G; vcurtain=(; image=img, path=[-11.045 36.077; -6.9846 36.1846], zrange=(-10000,0), clip=true))",
+            "f3dview(dem; vcurtain=(; image=gmtread(\"seismic.tif\"), path=ship_track, zrange=(-10000,0), clip=true))"),
     ],
     "Point cloud" => [
         ("cloud_z",           "points coloured by z (the default)",
