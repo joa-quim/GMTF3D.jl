@@ -119,9 +119,13 @@ the window is closed (unless `offscreen`).
   E.g. `h = view_points(D); ... ; sel = selection(h)`.
 - `onpick=nothing`: for full control, pass `f(rows::Vector{Int})` instead — called with
   the selected row indices into `D.data` on every change (replaces the default stash).
-- `pickcolor=(0.83,0.83,0.83)`: overlay colour for the selected points (light grey by
-  default, so it does not clash with the points' own colours). Accepts an RGB tuple in
-  `[0,1]`, a 0-255 triplet, or a colour name/`"#hex"`/gray number (as in `fill`).
+- `pickcolor=(0.83,0.83,0.83)`: recolour applied IN PLACE to the selected points (light grey
+  by default). Accepts an RGB tuple in `[0,1]`, a 0-255 triplet, or a colour name/`"#hex"`/gray
+  number (as in `fill`).
+  TODO: instead of a fixed grey, derive the colour MOST DISTINCT from those present in the
+  active colour scale (`pal`) so the selection always pops regardless of the cmap — e.g. the
+  max-min CIELAB-distance colour, or the palette's complementary. Compute from `pal` here and
+  pass it through the existing `pickcolor` plumbing. (Matching TODO in f3d_ext_interactor.cxx.)
 
 E.g. `view_points(D)`, `view_points(D; cmap=:roma)`, `view_points(D; vexag=10)`.
 
@@ -269,41 +273,16 @@ function _view_points_impl(D::GMT.GMTdataset; _handle_chan=nothing, color=:z, cl
 	# oversized). Set it always so cycling to a sprite shape looks right; Shift+/- adjusts live.
 	F3D.f3d_options_set_as_double(opts, "model.point_sprites.size", Cdouble(spritesize))
 
-	# Colour palette. PREFER an in-memory texture (gap #1): no temp PNG, and it
-	# survives f3d's per-render option re-push. The old path wrote a PNG, set
-	# `model.color.texture`, then deleted the file — but ANY later re-render (e.g. the
-	# Ctrl-drag vertical-scale changing render.model_scale) makes f3d re-read that path,
-	# now gone -> "Texture file does not exist ..." spam + lost colour. The in-memory
-	# image is re-applied every render with no file. Falls back to the PNG on a stock DLL.
-	palette_path = ""
-	if _has_inmem_texture()
-		palimg = F3D.f3d_image_new_params(Cuint(ncolor), Cuint(1), Cuint(3), F3D.BYTE)
-		GC.@preserve pal F3D.f3d_image_set_content(palimg, pointer(pal))
-		F3D.f3d_window_set_color_texture(window, palimg)   # copies content into the renderer
-		F3D.f3d_image_delete(palimg)
-	else
-		palette_path = write_palette_png(pal, ncolor)
-		F3D.f3d_options_set_as_string(opts, "model.color.texture", palette_path)
-	end
-
-	GC.@preserve pts tc begin
-		mesh = Ref(F3D.f3d_mesh_t(
-			pointer(pts), Csize_t(length(pts)),
-			C_NULL,       Csize_t(0),                  # no normals (point cloud)
-			pointer(tc),  Csize_t(length(tc)),         # texcoords -> palette colour
-			C_NULL,       Csize_t(0),                  # empty sides   -> point cloud
-			C_NULL,       Csize_t(0),                  # empty indices -> point cloud
-		))
-		e = Ref{Cstring}(C_NULL)
-		if F3D.f3d_mesh_is_valid(mesh, e) != 1
-			msg = e[] == C_NULL ? "unknown" : unsafe_string(e[])
-			e[] == C_NULL || F3D.f3d_utils_string_free(e[])
-			F3D.f3d_engine_delete(engine)
-			error("point-cloud mesh invalid: $msg")
-		end
-		e[] == C_NULL || F3D.f3d_utils_string_free(e[])
-		F3D.f3d_scene_add_mesh(scene, mesh) == 1 || error("f3d_scene_add_mesh failed")
-	end
+	# Colour palette as a per-point scivis scalar + colormap on the zero-copy mesh_view:
+	# no temp PNG, and it survives f3d's per-render option re-push (a PNG `model.color.
+	# texture` would be re-read on every re-render — e.g. the Ctrl-drag vertical scale —
+	# and break once its temp file is deleted).
+	uscalar = Vector{Float32}(undef, N)            # palette position per point (the texcoord u)
+	@inbounds for i in 1:N;  uscalar[i] = tc[2i-1];  end
+	_set_scivis_palette!(opts, pal, ncolor, "color"; cells=false, range=(0.0, 1.0))
+	add_mesh_view!(scene, engine, pts, Float32[], Float32[], UInt32[], UInt32[];
+	               name="points", point_scalars=[mvscalar("color", uscalar)]) ||
+		(F3D.f3d_engine_delete(engine); error("f3d_scene_add_mesh_view failed"))
 
 	isempty(lights) || add_lights!(scene, lights)
 	println(title, ": ", N, " points, ", ncolor, " colours")
@@ -313,7 +292,6 @@ function _view_points_impl(D::GMT.GMTdataset; _handle_chan=nothing, color=:z, cl
 	azimuth   == 0 || F3D.f3d_camera_azimuth(camera, Cdouble(azimuth))
 	elevation == 0 || F3D.f3d_camera_elevation(camera, Cdouble(elevation))
 	F3D.f3d_window_render(window)
-	isempty(palette_path) || rm(palette_path; force=true)   # PNG fallback: drop after first read
 
 	# Sprites ignore the palette texture -> push the per-point RGB onto the gaussian
 	# mapper now that the sprite actor exists (after the first render). gap #9.
@@ -359,6 +337,7 @@ function _view_points_impl(D::GMT.GMTdataset; _handle_chan=nothing, color=:z, cl
 	end
 
 	if offscreen
+		_mv_release!(engine)
 		F3D.f3d_engine_delete(engine)
 		return nothing
 	end
@@ -402,6 +381,7 @@ function _view_points_impl(D::GMT.GMTdataset; _handle_chan=nothing, color=:z, cl
 	colorbar && !categorical && _has_f3d_ext() && F3D.f3d_ext_disable_colorbar(window)
 	(lines === nothing) || !_has_f3d_ext() || F3D.f3d_ext_clear_lines(window)
 	F3D.f3d_scene_clear(scene)        # drop actors before GL teardown -> avoids close-time AV in engine_delete
+	_mv_release!(engine)              # zero-copy buffers safe to drop only after scene cleared
 	F3D.f3d_engine_delete(engine)
 	return nothing
 end

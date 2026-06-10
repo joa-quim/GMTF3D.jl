@@ -175,7 +175,7 @@ function fv_to_mesh(fv::GMT.GMTfv; flat::Bool=false, drape::Bool=false)
 				u, v = drape_uv(i);  tc[2i-1] = u;  tc[2i] = v
 			end
 		end
-		return (; points, normals, texcoords = tc, sides, indices, palette = UInt8[], ncolors = 0)
+		return (; points, normals, texcoords = tc, sides, indices, face_scalar = Float32[], palette = UInt8[], ncolors = 0)
 	end
 
 	# Split-vertex path: required for flat shading and/or per-face colour.
@@ -214,6 +214,10 @@ function fv_to_mesh(fv::GMT.GMTfv; flat::Bool=false, drape::Bool=false)
 	texcoords = Float32[];  (coloured || drape) && sizehint!(texcoords, 2ncorners)
 	sides     = UInt32[];   sizehint!(sides,   nfaces)
 	indices   = UInt32[];   sizehint!(indices, ncorners)
+	# Per-face colour scalar for the zero-copy mesh_view path: the 1-based palette INDEX, so
+	# with scivis range (1, ncol) it lands EXACTLY on the colormap control points (no linear
+	# blend between palette colours -> exact per-face colour, matching the palette texture).
+	face_scalar = Float32[];  coloured && sizehint!(face_scalar, nfaces)
 	vid = 0
 	fi  = 0
 	for Fm in fv.faces
@@ -222,7 +226,8 @@ function fv_to_mesh(fv::GMT.GMTfv; flat::Bool=false, drape::Bool=false)
 		for r in 1:nf
 			fi += 1
 			fn = flat ? newell_normal(V, Fm, r, npf) : (0f0, 0f0, 0f0)
-			u  = coloured ? (cidx[fi] - 0.5f0) / ncol : 0f0   # texel centre
+			u  = coloured ? (cidx[fi] - 0.5f0) / ncol : 0f0   # texel centre (texture path)
+			coloured && push!(face_scalar, Float32(cidx[fi]))
 			push!(sides, UInt32(npf))
 			for a in 1:npf
 				vi = Fm[r, a]
@@ -242,7 +247,149 @@ function fv_to_mesh(fv::GMT.GMTfv; flat::Bool=false, drape::Bool=false)
 		end
 	end
 
-	return (; points, normals, texcoords, sides, indices, palette, ncolors = ncol)
+	return (; points, normals, texcoords, sides, indices, face_scalar, palette, ncolors = ncol)
+end
+
+# ---------------------------------------------------------------------------------------
+# Zero-copy mesh path (F3D `mesh_view` C binding). `f3d_scene_add_mesh_view` keeps the
+# caller's pointers and reads them at each render, so the Julia arrays must outlive the
+# WHOLE window session, not just the add call. The interactive path blocks in the event
+# loop with `m` no longer referenced -> GC could free it mid-session. We root every array
+# in a per-engine keep-alive registry, released when the engine is deleted.
+const _MV_KEEP = Dict{Ptr{Cvoid}, Vector{Any}}()
+_mv_keep!(engine, objs::Vector{Any}) = (append!(get!(() -> Any[], _MV_KEEP, Ptr{Cvoid}(engine)), objs); nothing)
+_mv_release!(engine) = (delete!(_MV_KEEP, Ptr{Cvoid}(engine)); nothing)
+
+# Build an f3d_data_array_t view over a Julia array (no copy). Empty array -> empty slot.
+# `name` (kept alive by the caller) is required for scalars so scivis can select them.
+function _mv_arr(a::Vector, ty::F3D.f3d_mesh_data_type_t, comps::Integer, name=C_NULL)
+	isempty(a) && return F3D.f3d_data_array_t()
+	cname = name === C_NULL ? Cstring(C_NULL) : Base.unsafe_convert(Cstring, name)
+	F3D.f3d_data_array_t(cname, ty, Ptr{Cvoid}(pointer(a)), Csize_t(comps), Csize_t(comps), Cint(0))
+end
+
+# Map a flat UInt8 RGB palette (3*ncolor) to an F3D scivis colormap string of normalized
+# "x,r,g,b,..." control points (all in [0,1]), evenly spaced over [0,1].
+function _palette_colormap_str(pal::Vector{UInt8}, ncolor::Int)
+	io = IOBuffer()
+	@inbounds for i in 0:(ncolor - 1)
+		x = ncolor == 1 ? 0.0 : i / (ncolor - 1)
+		o = 3i
+		print(io, x, ",", pal[o+1] / 255, ",", pal[o+2] / 255, ",", pal[o+3] / 255)
+		i < ncolor - 1 && print(io, ",")
+	end
+	String(take!(io))
+end
+
+# Configure F3D scivis to colour the active mesh by `array_name` through a colormap built
+# from the GMT palette. Replaces the palette-texture hack on the zero-copy path.
+function _set_scivis_palette!(opts, pal::Vector{UInt8}, ncolor::Int, array_name::AbstractString;
+                              cells::Bool=false, range=(0.0, 1.0))
+	F3D.f3d_options_set_as_bool(opts, "model.scivis.enable", Cint(1))
+	F3D.f3d_options_set_as_bool(opts, "model.scivis.cells", Cint(cells ? 1 : 0))
+	F3D.f3d_options_set_as_string(opts, "model.scivis.array_name", String(array_name))
+	F3D.f3d_options_set_as_int(opts, "model.scivis.component", Cint(0))
+	F3D.f3d_options_set_as_string_representation(opts, "model.scivis.colormap", _palette_colormap_str(pal, ncolor))
+	F3D.f3d_options_set_as_double_vector(opts, "model.scivis.range", Cdouble[range[1], range[2]], Csize_t(2))
+	return nothing
+end
+
+# A named scalar field to attach to the mesh (Float32, `comps` per element), colored
+# through the scivis colormap. `cells=false` => per-point, `cells=true` => per-face.
+const MVScalar = NamedTuple{(:name, :data, :comps), Tuple{String, Vector{Float32}, Int}}
+mvscalar(name, data::Vector{Float32}, comps::Integer=1) = (; name=String(name), data, comps=Int(comps))
+
+# Build the row-major 4x4 transform passed to `mesh_view::transform_3d` (via the C struct's
+# `transform_matrix`). Returns an all-zero tuple for "no transform" (the C side reads an all-zero
+# matrix as the identity). `transform` may be:
+#   nothing                              -> identity (all-zero sentinel)
+#   an iterable of 16 reals             -> used verbatim as a row-major 4x4 matrix
+#   a NamedTuple (; scale, translate)    -> scale is a scalar or (sx,sy,sz); translate is (tx,ty,tz)
+# The common GMT use is vertical exaggeration: `transform = (; scale = (1, 1, vexag))`.
+function _transform_matrix(transform)::NTuple{16,Cdouble}
+	transform === nothing && return ntuple(_ -> 0.0, 16)
+	if transform isa NamedTuple
+		s = get(transform, :scale, 1.0)
+		sx, sy, sz = s isa Number ? (Float64(s), Float64(s), Float64(s)) :
+		                            (Float64(s[1]), Float64(s[2]), Float64(s[3]))
+		t = get(transform, :translate, (0.0, 0.0, 0.0))
+		tx, ty, tz = Float64(t[1]), Float64(t[2]), Float64(t[3])
+		return (sx, 0.0, 0.0, tx,  0.0, sy, 0.0, ty,  0.0, 0.0, sz, tz,  0.0, 0.0, 0.0, 1.0)
+	end
+	m = collect(Float64, transform)
+	length(m) == 16 || throw(ArgumentError("transform must be 16 elements (row-major 4x4), got $(length(m))"))
+	return ntuple(i -> m[i], 16)
+end
+
+"""
+	add_mesh_view!(scene, engine, points, normals, texcoords, sides, indices;
+	               name, point_scalars, cell_scalars) -> Bool
+
+Add a mesh to `scene` via the zero-copy `mesh_view` binding. `points/normals/texcoords`
+are flat `Float32` (xyz/xyz/uv); `sides`/`indices` are `UInt32` (per-face vertex counts and
+0-based corner indices). Empty `sides` => a point cloud (all points in one polyvertex).
+`point_scalars`/`cell_scalars` are vectors of `mvscalar(name, data, comps)` colored through
+the scivis colormap (set the colormap + `model.scivis.array_name` to one of these names via
+`_set_scivis_palette!`). All referenced and synthesized arrays are rooted in the per-engine
+keep-alive registry so they survive the whole window session.
+"""
+function add_mesh_view!(scene, engine, points::Vector{Float32}, normals::Vector{Float32},
+                        texcoords::Vector{Float32}, sides::Vector{UInt32}, indices::Vector{UInt32};
+                        name::AbstractString="mesh",
+                        point_scalars::Vector{<:NamedTuple}=MVScalar[],
+                        cell_scalars::Vector{<:NamedTuple}=MVScalar[],
+                        texture=nothing,   # (; data::Vector{UInt8}, w, h, comps, emissive::Bool)
+                        transform=nothing) # identity, 16-elem row-major 4x4, or (; scale, translate)
+	npts = length(points) ÷ 3
+	keep = Any[points, normals, texcoords]
+
+	pts_da = _mv_arr(points,    F3D.F3D_MESH_DATA_F32, 3)
+	nrm_da = _mv_arr(normals,   F3D.F3D_MESH_DATA_F32, 3)
+	tex_da = _mv_arr(texcoords, F3D.F3D_MESH_DATA_F32, 2)
+
+	polys = F3D.f3d_cell_array_t()
+	verts = F3D.f3d_cell_array_t()
+	if !isempty(sides)                              # surfacic mesh: polygons via prefix-sum offsets
+		offsets = Vector{UInt32}(undef, length(sides) + 1)
+		acc = UInt32(0);  @inbounds offsets[1] = 0
+		@inbounds for i in eachindex(sides);  acc += sides[i];  offsets[i+1] = acc;  end
+		push!(keep, offsets, indices)
+		polys = F3D.f3d_cell_array_t(Csize_t(length(offsets)), _mv_arr(offsets, F3D.F3D_MESH_DATA_U32, 1),
+		                             Csize_t(length(indices)), _mv_arr(indices, F3D.F3D_MESH_DATA_U32, 1))
+	else                                            # point cloud: single polyvertex over all points
+		voff = UInt32[0, npts]
+		vidx = collect(UInt32, 0:(npts - 1))
+		push!(keep, voff, vidx)
+		verts = F3D.f3d_cell_array_t(Csize_t(2), _mv_arr(voff, F3D.F3D_MESH_DATA_U32, 1),
+		                             Csize_t(npts), _mv_arr(vidx, F3D.F3D_MESH_DATA_U32, 1))
+	end
+
+	# Scalar descriptor arrays must outlive the scene too -> build into `keep` and pin.
+	_descs(scs) = isempty(scs) ? (C_NULL, Csize_t(0)) : begin
+		da = [(push!(keep, s.data); _mv_arr(s.data, F3D.F3D_MESH_DATA_F32, s.comps, s.name)) for s in scs]
+		push!(keep, da)
+		(pointer(da), Csize_t(length(da)))
+	end
+	pscal_ptr, pscal_n = _descs(point_scalars)
+	cscal_ptr, cscal_n = _descs(cell_scalars)
+
+	# Optional in-memory base-color texture (gap#1 fold): zero-copy, pin the pixel buffer.
+	tx_ptr = C_NULL;  tx_w = tx_h = tx_c = Csize_t(0);  tx_emis = Cint(0)
+	if texture !== nothing
+		push!(keep, texture.data)
+		tx_ptr  = Ptr{Cvoid}(pointer(texture.data))
+		tx_w = Csize_t(texture.w);  tx_h = Csize_t(texture.h);  tx_c = Csize_t(texture.comps)
+		tx_emis = Cint(texture.emissive ? 1 : 0)
+	end
+
+	view = F3D.f3d_memory_view_t(Csize_t(npts), pts_da, nrm_da, tex_da,
+	                             verts, F3D.f3d_cell_array_t(), polys,
+	                             pscal_ptr, pscal_n, cscal_ptr, cscal_n,
+	                             tx_ptr, tx_w, tx_h, tx_c, tx_emis,
+	                             _transform_matrix(transform))
+	_mv_keep!(engine, keep)
+	r = GC.@preserve keep F3D.f3d_scene_add_mesh_view(scene, Ref(view), String(name), 0.0, 0.0)
+	return r == 1
 end
 
 # Collapse a path the way libf3d wants. The shipped DLL auto-collapses any path
@@ -256,19 +403,44 @@ function collapse_path(p::AbstractString)
 end
 
 # ---------------------------------------------------------------------------
-# Write the palette as a 1 x ncolors RGB PNG via F3D's own image API and return
-# the (collapsed) temp file path (so we need no extra image dependency).
+# GMTimage -> packed RGB(A) byte buffer for an in-memory `mesh_view` base-colour
+# texture (gap#1 fold: no temp PNG). VTK's vtkImageData has origin lower-left, so
+# texture row 0 must be SOUTH (= drape v=0 = ymin); columns run west->east; bands
+# packed per pixel.
+#
+# CRITICAL — honour `I.layout`. The array dim order depends on it:
+#   layout[2]=='C' (column-major, e.g. mat2img default "TCBa") -> I.image is [lat,lon]
+#   layout[2]=='R' (row-major,    e.g. mosaic/Goog tiles "TRBa") -> I.image is [lon,lat]
+# Ignoring this transposes/rotates row-major images (the Google-drape bug). Also
+# layout[1]=='B' means the array's first lat index is south (no flip needed).
+#
+# Returns `(data, w, h, comps)`. Grey -> replicated to RGB; alpha kept if present
+# (comps=4 -> renderer forces translucent).
 # ---------------------------------------------------------------------------
-function write_palette_png(palette::Vector{UInt8}, ncolors::Int)
-	img = F3D.f3d_image_new_params(Cuint(ncolors), Cuint(1), Cuint(3), F3D.BYTE)
-	(img == C_NULL) && error("failed to create palette image")
-	path = joinpath(tempdir(), "f3d_palette_$(getpid()).png")
-	GC.@preserve palette begin
-		F3D.f3d_image_set_content(img, pointer(palette))
-		F3D.f3d_image_save(img, path, F3D.PNG)
+function img_to_texbuf(I::GMT.GMTimage)
+	S   = I.image
+	d3  = ndims(S) == 3
+	nb  = d3 ? size(S, 3) : 1
+	comps = nb >= 4 ? 4 : 3                      # RGB or RGBA (grey/2-band -> RGB)
+	lay = I.layout
+	rowmajor    = length(lay) >= 2 && lay[2] == 'R'   # 'R' -> array is [lon, lat]
+	north_first = isempty(lay) || lay[1] != 'B'       # 'T' (default) -> lat index 1 is north
+	nlon, nlat  = rowmajor ? (size(S, 1), size(S, 2)) : (size(S, 2), size(S, 1))
+	@inline pix(lat, lon, b) = d3 ? (rowmajor ? S[lon, lat, b] : S[lat, lon, b]) :
+	                                 (rowmajor ? S[lon, lat]    : S[lat, lon])
+	data = Vector{UInt8}(undef, nlat * nlon * comps)
+	k = 1
+	@inbounds for orow in 0:nlat-1               # texture row 0 = SOUTH
+		lat = north_first ? (nlat - orow) : (orow + 1)   # 1-based lat index into the array
+		for lon in 1:nlon                        # west -> east
+			data[k]   = pix(lat, lon, 1)
+			data[k+1] = nb >= 2 ? pix(lat, lon, 2) : pix(lat, lon, 1)
+			data[k+2] = nb >= 3 ? pix(lat, lon, 3) : pix(lat, lon, 1)
+			comps == 4 && (data[k+3] = pix(lat, lon, 4))
+			k += comps
+		end
 	end
-	F3D.f3d_image_delete(img)
-	return collapse_path(path)
+	return data, nlon, nlat, comps
 end
 
 # ---------------------------------------------------------------------------
@@ -645,8 +817,6 @@ end
 
 # True if the running libf3d carries the c/f3d_ext_*.cxx symbols (rebuilt DLL).
 _has_f3d_ext() = Libdl.dlsym(Libdl.dlopen(F3D.libf3d), :f3d_ext_enable_cube_axes; throw_error=false) !== nothing
-# gap #1: in-memory base-colour texture (no temp PNG). Same rebuilt DLL as f3d_ext.
-_has_inmem_texture() = Libdl.dlsym(Libdl.dlopen(F3D.libf3d), :f3d_window_set_color_texture; throw_error=false) !== nothing
 
 # Turn on the extended viewer interactions (all need a rebuilt f3d_ext DLL). Called
 # AFTER the interactor exists and after the first render (cube axes needs bounds).
