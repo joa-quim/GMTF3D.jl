@@ -118,6 +118,20 @@ f3dview(G; drape=I, azimuth=10, elevation=45)
 
 ![drape_satellite](assets/gallery/gallery_drape_satellite.png)
 
+## Vertical curtain (seismic / midwater profile)
+
+### `grid_vcurtain`
+
+a real seismic profile hung under the bathymetry along a ship track, clipped to the seafloor (needs network).
+
+```julia
+img = joinpath(pkgdir(GMTF3D), "examples", "assets", "seismic_E46.jpg")
+G = GMT.grdcut("@earth_relief_04m", region=(-12,0,35,45))
+f3dview(G; vcurtain=(; image=img, path=[-11.045 36.077; -6.9846 36.1846], zrange=(-10000,0), clip=true))
+```
+
+![grid_vcurtain](assets/gallery/gallery_grid_vcurtain.png)
+
 ## Point cloud
 
 ### `cloud_z`
